@@ -17,12 +17,59 @@ const parser = new Parser();
 
 // Configuration
 const CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes in milliseconds
-const DB_FILE = path.join(__dirname, 'newsbot.db');
+// Store database in data directory to avoid volume mount issues
+const DB_FILE = path.join(__dirname, 'data', 'newsbot.db');
 const MAX_NEWS_PER_FEED = 10; // Maximum number of news items to check per feed
 const MAX_MANUAL_NEWS = 5; // Maximum number of news items to send for /news command
 
-// Initialize SQLite database
-const db = new Database(DB_FILE);
+// Ensure database directory exists and is writable (synchronous)
+function ensureDatabaseDirectory() {
+  try {
+    const dbDir = path.dirname(DB_FILE);
+    const fsSync = require('fs');
+    // Create directory if it doesn't exist
+    if (!fsSync.existsSync(dbDir)) {
+      fsSync.mkdirSync(dbDir, { recursive: true });
+    }
+    // Ensure directory is writable
+    fsSync.accessSync(dbDir, fsSync.constants.W_OK);
+    console.log(`Database directory ready: ${dbDir}`);
+  } catch (error) {
+    console.error('Error ensuring database directory:', error);
+    throw error;
+  }
+}
+
+// Initialize SQLite database with error handling
+let db;
+try {
+  // Ensure directory exists first
+  ensureDatabaseDirectory();
+  
+  // Initialize database synchronously (better-sqlite3 is synchronous)
+  db = new Database(DB_FILE);
+  console.log(`Database initialized at: ${DB_FILE}`);
+} catch (error) {
+  console.error('Error initializing database:', error);
+  console.error('DB_FILE:', DB_FILE);
+  console.error('__dirname:', __dirname);
+  console.error('Current working directory:', process.cwd());
+  
+  // Try to create directory and retry
+  try {
+    const fsSync = require('fs');
+    const dbDir = path.dirname(DB_FILE);
+    fsSync.mkdirSync(dbDir, { recursive: true });
+    // Set permissions
+    fsSync.chmodSync(dbDir, 0o755);
+    db = new Database(DB_FILE);
+    console.log(`Database initialized at: ${DB_FILE} (after creating directory)`);
+  } catch (retryError) {
+    console.error('Failed to initialize database after retry:', retryError);
+    console.error('Please check directory permissions and ensure /app is writable');
+    process.exit(1);
+  }
+}
 
 // Load RSS feeds from config
 let rssFeeds = [];

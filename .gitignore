@@ -3,6 +3,7 @@ node_modules/
 state.json
 *.db
 *.db-journal
+data/
 *.log
 .DS_Store
 

@@ -21,8 +21,10 @@ COPY . .
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-# Create directory for state file
-RUN mkdir -p /app && chmod 755 /app
+# Create directories and ensure they're writable
+RUN mkdir -p /app/data && \
+    chmod 755 /app && \
+    chmod 755 /app/data
 
 # Use entrypoint script
 ENTRYPOINT ["/app/entrypoint.sh"]
