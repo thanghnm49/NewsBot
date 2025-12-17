@@ -2,6 +2,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const Parser = require('rss-parser');
 const fs = require('fs').promises;
 const path = require('path');
+const Database = require('better-sqlite3');
 require('dotenv').config();
 
 // Initialize Telegram Bot
@@ -16,49 +17,79 @@ const parser = new Parser();
 
 // Configuration
 const CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes in milliseconds
-const STATE_FILE = path.join(__dirname, 'state.json');
+const DB_FILE = path.join(__dirname, 'newsbot.db');
 const MAX_NEWS_PER_FEED = 10; // Maximum number of news items to check per feed
 const MAX_MANUAL_NEWS = 5; // Maximum number of news items to send for /news command
+
+// Initialize SQLite database
+const db = new Database(DB_FILE);
 
 // Load RSS feeds from config
 let rssFeeds = [];
 let chatIds = new Set();
 
-// Load state (last seen news items)
-let state = {};
+// Initialize database
+function initDatabase() {
+  // Create news table if it doesn't exist
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS news (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guid TEXT NOT NULL UNIQUE,
+      title TEXT NOT NULL,
+      link TEXT,
+      feedUrl TEXT NOT NULL,
+      isSent INTEGER DEFAULT 0,
+      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  
+  // Create indexes
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_guid ON news(guid);
+    CREATE INDEX IF NOT EXISTS idx_feedUrl ON news(feedUrl);
+    CREATE INDEX IF NOT EXISTS idx_isSent ON news(isSent)
+  `);
+  
+  console.log('Database initialized');
+}
 
-// Initialize state file if it doesn't exist
-async function loadState() {
+// Check if news exists in database
+function newsExists(guid) {
+  const stmt = db.prepare('SELECT id FROM news WHERE guid = ?');
+  const result = stmt.get(guid);
+  return result !== undefined;
+}
+
+// Insert news into database (only if not exists)
+function insertNews(guid, title, link, feedUrl) {
+  if (newsExists(guid)) {
+    return false; // Already exists, don't insert
+  }
+  
   try {
-    const data = await fs.readFile(STATE_FILE, 'utf8');
-    const loadedState = JSON.parse(data);
-    // Migrate old state format (single GUID) to new format (array of GUIDs)
-    state = {};
-    for (const [key, value] of Object.entries(loadedState)) {
-      if (Array.isArray(value)) {
-        state[key] = value;
-      } else {
-        // Old format: single GUID string, convert to array
-        state[key] = value ? [value] : [];
-      }
-    }
+    const stmt = db.prepare('INSERT INTO news (guid, title, link, feedUrl) VALUES (?, ?, ?, ?)');
+    stmt.run(guid, title, link, feedUrl);
+    return true; // Successfully inserted
   } catch (error) {
-    if (error.code === 'ENOENT') {
-      state = {};
-      await saveState();
-    } else {
-      console.error('Error loading state:', error);
-      state = {};
+    // Ignore unique constraint errors (already exists)
+    if (error.code !== 'SQLITE_CONSTRAINT_UNIQUE') {
+      console.error('Error inserting news:', error);
     }
+    return false;
   }
 }
 
-async function saveState() {
-  try {
-    await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch (error) {
-    console.error('Error saving state:', error);
-  }
+// Check if news is already sent
+function isNewsSent(guid) {
+  const stmt = db.prepare('SELECT isSent FROM news WHERE guid = ?');
+  const result = stmt.get(guid);
+  return result ? result.isSent === 1 : false;
+}
+
+// Mark news as sent
+function markNewsAsSent(guid) {
+  const stmt = db.prepare('UPDATE news SET isSent = 1 WHERE guid = ?');
+  stmt.run(guid);
 }
 
 // Load RSS feeds configuration
@@ -111,6 +142,16 @@ async function getLatestNewsForChat(chatId) {
     const itemsToSend = feed.items.slice(0, MAX_MANUAL_NEWS);
     
     for (const item of itemsToSend) {
+      const itemGuid = item.guid || item.link || item.title;
+      
+      // Skip if already sent
+      if (isNewsSent(itemGuid)) {
+        continue;
+      }
+      
+      // Insert into database if not exists
+      insertNews(itemGuid, item.title || 'No title', item.link || '', feedConfig.url);
+      
       const message = formatNewsMessage(feedConfig.name, item);
       
       try {
@@ -119,6 +160,8 @@ async function getLatestNewsForChat(chatId) {
           disable_web_page_preview: false
         });
         newsFound++;
+        // Mark as sent
+        markNewsAsSent(itemGuid);
         // Small delay between messages to avoid rate limiting
         await new Promise(resolve => setTimeout(resolve, 500));
       } catch (error) {
@@ -141,20 +184,25 @@ async function checkForNewNews() {
       continue;
     }
 
-    const feedKey = feedConfig.url;
-    const seenGuids = state[feedKey] || [];
-    const seenGuidsSet = new Set(seenGuids);
-    
     // Get items to check (limit to MAX_NEWS_PER_FEED)
     const itemsToCheck = feed.items.slice(0, MAX_NEWS_PER_FEED);
     const newItems = [];
     
-    // Find all new items
+    // Find all new items that don't exist in database or haven't been sent
     for (const item of itemsToCheck) {
       const itemGuid = item.guid || item.link || item.title;
-      if (!seenGuidsSet.has(itemGuid)) {
+      
+      // Skip if already sent
+      if (isNewsSent(itemGuid)) {
+        continue;
+      }
+      
+      // Insert into database if not exists (returns true if inserted, false if already exists)
+      const wasInserted = insertNews(itemGuid, item.title || 'No title', item.link || '', feedConfig.url);
+      
+      // Only process if it's a new item (was just inserted or exists but not sent)
+      if (wasInserted || !isNewsSent(itemGuid)) {
         newItems.push(item);
-        seenGuidsSet.add(itemGuid);
       }
     }
 
@@ -167,9 +215,6 @@ async function checkForNewNews() {
     // Check if there are any subscribers
     if (chatIds.size === 0) {
       console.log(`⚠️  No subscribers found. Users need to send /start to receive news updates.`);
-      // Still update state so we don't send duplicate messages later
-      state[feedKey] = Array.from(seenGuidsSet);
-      await saveState();
       continue;
     }
     
@@ -177,6 +222,13 @@ async function checkForNewNews() {
     let totalSent = 0;
     
     for (const item of newItems) {
+      const itemGuid = item.guid || item.link || item.title;
+      
+      // Double-check: skip if already sent (race condition protection)
+      if (isNewsSent(itemGuid)) {
+        continue;
+      }
+      
       const message = formatNewsMessage(feedConfig.name, item);
       let sentCount = 0;
       
@@ -199,17 +251,17 @@ async function checkForNewNews() {
         }
       }
       
-      totalSent += sentCount;
-      console.log(`✅ Sent "${item.title.substring(0, 50)}..." to ${sentCount} subscriber(s)`);
+      // Mark as sent only if successfully sent to at least one subscriber
+      if (sentCount > 0) {
+        markNewsAsSent(itemGuid);
+        totalSent += sentCount;
+        console.log(`✅ Sent "${item.title.substring(0, 50)}..." to ${sentCount} subscriber(s)`);
+      }
     }
 
-    console.log(`📤 Sent ${newItems.length} news item(s) to ${totalSent / newItems.length} subscriber(s) from ${feedConfig.name}`);
-
-    // Update state with all seen GUIDs (keep only recent ones to avoid state file growing too large)
-    const allSeenGuids = Array.from(seenGuidsSet);
-    // Keep only the most recent MAX_NEWS_PER_FEED * 2 GUIDs to prevent state file from growing too large
-    state[feedKey] = allSeenGuids.slice(0, MAX_NEWS_PER_FEED * 2);
-    await saveState();
+    if (totalSent > 0) {
+      console.log(`📤 Sent ${newItems.length} news item(s) to subscribers from ${feedConfig.name}`);
+    }
   }
 }
 
@@ -334,7 +386,9 @@ bot.on('polling_error', (error) => {
 async function start() {
   console.log('Starting NewsBot...');
   
-  await loadState();
+  // Initialize database
+  initDatabase();
+  
   await loadRSSFeeds();
   
   // Initial check
@@ -350,6 +404,19 @@ async function start() {
     console.log(`⚠️  No subscribers yet. Users need to send /start to the bot to receive news updates.`);
   }
 }
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\nShutting down...');
+  db.close();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('\nShutting down...');
+  db.close();
+  process.exit(0);
+});
 
 // Start the bot
 start().catch(console.error);

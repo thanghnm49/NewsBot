@@ -1,6 +1,8 @@
 node_modules/
 .env
 state.json
+*.db
+*.db-journal
 *.log
 .DS_Store
 

@@ -9,8 +9,10 @@ services:
       - .env
     volumes:
       - ./rss-feeds.json:/app/rss-feeds.json
-      - ./index.js:/app/index.js
-      - ./package.json:/app/package.json
+      - ./.env:/app/.env
+      - ./newsbot.db:/app/newsbot.db
     environment:
       - NODE_ENV=production
+      - GIT_REPO_URL=https://github.com/thanghnm49/NewsBot.git
+      - GIT_BRANCH=main
 

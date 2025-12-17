@@ -70,59 +70,48 @@ npm start
 
 ## Deployment to VPS (Ubuntu)
 
-### Option 1: Using GitHub and Deploy Script
+### Deployment to VPS (Ubuntu)
 
-1. Push your code to GitHub (make sure `.env` is in `.gitignore`)
-
-2. SSH into your VPS:
+1. SSH into your VPS:
 ```bash
 ssh user@your-vps-ip
 ```
 
-3. Clone the repository:
+2. Create a directory and clone the repository (or create manually):
 ```bash
-git clone <your-github-url>
+mkdir -p NewsBot
 cd NewsBot
 ```
 
-4. Create `.env` file on the VPS:
+3. Create `.env` file with your bot token:
 ```bash
 nano .env
 ```
-Add your `TELEGRAM_BOT_TOKEN`
-
-5. Make deploy script executable and run it:
-```bash
-chmod +x deploy.sh
-./deploy.sh
+Add your `TELEGRAM_BOT_TOKEN`:
+```
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
 ```
 
-### Option 2: Manual Docker Deployment
-
-1. SSH into your VPS and clone the repository:
+4. Create `docker-compose.yml` and `Dockerfile` (or clone from GitHub):
 ```bash
-git clone <your-github-url>
-cd NewsBot
+# Option A: Clone from GitHub
+git clone https://github.com/thanghnm49/NewsBot.git .
+# Then create .env file
+
+# Option B: Create files manually (copy from repository)
 ```
 
-2. Create `.env` file with your bot token
-
-3. Build and run with Docker Compose:
+5. Build and run with Docker Compose:
 ```bash
 docker-compose up -d --build
 ```
 
-4. View logs:
+6. View logs:
 ```bash
 docker-compose logs -f
 ```
 
-### Option 3: Using Docker Only
-
-```bash
-docker build -t newsbot .
-docker run -d --name newsbot --restart unless-stopped --env-file .env -v $(pwd)/state.json:/app/state.json newsbot
-```
+**Note:** The bot automatically pulls the latest code from GitHub (`https://github.com/thanghnm49/NewsBot.git`) every time the container starts. No need to manually pull or restart after pushing code changes - just restart the container!
 
 ## Telegram Commands
 
@@ -174,32 +163,23 @@ NewsBot/
 
 ## Updating the Bot
 
-### After Code Changes (Git Pull)
+### After Code Changes
 
-If you've updated the code and pulled from GitHub:
+The bot **automatically pulls the latest code from GitHub** every time the container starts!
 
-**Quick restart (for code changes):**
+**To apply code changes:**
 ```bash
-chmod +x restart.sh
-./restart.sh
-```
-
-Or manually:
-```bash
-git pull
 docker-compose restart
 docker-compose logs -f
 ```
 
-**Full rebuild (if dependencies changed):**
-```bash
-chmod +x rebuild.sh
-./rebuild.sh
-```
+The entrypoint script will:
+1. Pull latest code from GitHub
+2. Install/update dependencies if needed
+3. Start the bot with the latest code
 
-Or manually:
+**For major changes (if dependencies changed):**
 ```bash
-git pull
 docker-compose up -d --build
 docker-compose logs -f
 ```
@@ -211,7 +191,7 @@ Edit `rss-feeds.json` and restart the bot:
 docker-compose restart
 ```
 
-Note: Code files (`index.js`, `package.json`) are mounted as volumes, so code changes take effect after restart. For dependency changes, rebuild is required.
+**Note:** The bot automatically pulls from `https://github.com/thanghnm49/NewsBot.git` on every container start, so your code is always up-to-date!
 
 ## License
 
