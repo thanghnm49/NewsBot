@@ -92,42 +92,47 @@ function normalizeLink(link) {
   }
 }
 
-// Check if news exists in database by guid, title, or link
-function newsExists(guid, title, link) {
+// Check if news exists in database by guid, title, or link - returns full record
+function findExistingNews(guid, title, link) {
   // Check by GUID first (most reliable)
   if (guid) {
-    const stmt = db.prepare('SELECT id FROM news WHERE guid = ?');
+    const stmt = db.prepare('SELECT * FROM news WHERE guid = ?');
     const result = stmt.get(guid);
     if (result) return result;
   }
   
   // Check by normalized link
-  if (link) {
+  if (link && link.trim()) {
     const normalizedLink = normalizeLink(link);
-    const stmt = db.prepare('SELECT id FROM news WHERE LOWER(link) = ? OR link = ?');
+    const stmt = db.prepare('SELECT * FROM news WHERE (LOWER(link) = ? OR link = ?) AND link IS NOT NULL AND link != ""');
     const result = stmt.get(normalizedLink, link);
-    if (result) return result;
+    if (result) {
+      console.log(`Found duplicate by link: ${link.substring(0, 50)}... (existing GUID: ${result.guid})`);
+      return result;
+    }
   }
   
   // Check by normalized title (only if title is meaningful)
   if (title && title.length > 10) {
     const normalizedTitle = normalizeTitle(title);
-    const stmt = db.prepare('SELECT id FROM news WHERE LOWER(TRIM(title)) = ?');
+    const stmt = db.prepare('SELECT * FROM news WHERE LOWER(TRIM(title)) = ? AND title IS NOT NULL');
     const result = stmt.get(normalizedTitle);
-    if (result) return result;
+    if (result) {
+      console.log(`Found duplicate by title: ${title.substring(0, 50)}... (existing GUID: ${result.guid})`);
+      return result;
+    }
   }
   
-  return undefined;
+  return null;
 }
 
 // Insert news into database (only if not exists) - returns the news record
 function insertNews(guid, title, link, feedUrl) {
   // Check if news already exists by guid, title, or link
-  const existing = newsExists(guid, title, link);
+  const existing = findExistingNews(guid, title, link);
   if (existing) {
-    // Return existing record
-    const stmt = db.prepare('SELECT * FROM news WHERE id = ?');
-    return stmt.get(existing.id);
+    // Return existing record (use its GUID for consistency)
+    return existing;
   }
   
   try {
@@ -142,10 +147,9 @@ function insertNews(guid, title, link, feedUrl) {
       console.error('Error inserting news:', error);
     }
     // Return existing record if constraint violation
-    const existingCheck = newsExists(guid, title, link);
+    const existingCheck = findExistingNews(guid, title, link);
     if (existingCheck) {
-      const stmt = db.prepare('SELECT * FROM news WHERE id = ?');
-      return stmt.get(existingCheck.id);
+      return existingCheck;
     }
     // Fallback to guid lookup
     const stmt = db.prepare('SELECT * FROM news WHERE guid = ?');
@@ -155,58 +159,41 @@ function insertNews(guid, title, link, feedUrl) {
 
 // Check if news is already sent (by guid, title, or link)
 function isNewsSent(guid, title, link) {
-  // First try to find by guid
-  if (guid) {
-    const stmt = db.prepare('SELECT isSent FROM news WHERE guid = ?');
-    const result = stmt.get(guid);
-    if (result) return result.isSent === 1;
+  // Find existing record by guid, title, or link
+  const existing = findExistingNews(guid, title, link);
+  if (existing) {
+    return existing.isSent === 1;
   }
-  
-  // Check by normalized link
-  if (link) {
-    const normalizedLink = normalizeLink(link);
-    const stmt = db.prepare('SELECT isSent FROM news WHERE LOWER(link) = ? OR link = ?');
-    const result = stmt.get(normalizedLink, link);
-    if (result) return result.isSent === 1;
-  }
-  
-  // Check by normalized title
-  if (title && title.length > 10) {
-    const normalizedTitle = normalizeTitle(title);
-    const stmt = db.prepare('SELECT isSent FROM news WHERE LOWER(TRIM(title)) = ?');
-    const result = stmt.get(normalizedTitle);
-    if (result) return result.isSent === 1;
-  }
-  
   return false;
 }
 
-// Mark news as sent (atomic operation) - can mark by guid, title, or link
+// Mark news as sent (atomic operation) - marks ALL matching records by guid, title, or link
 function markNewsAsSent(guid, title, link) {
-  // Try to mark by guid first
-  if (guid) {
-    const stmt = db.prepare('UPDATE news SET isSent = 1 WHERE guid = ? AND isSent = 0');
-    const result = stmt.run(guid);
-    if (result.changes > 0) return true;
+  // Find existing record first to get its actual GUID
+  const existing = findExistingNews(guid, title, link);
+  if (!existing) {
+    return false; // Doesn't exist, can't mark
   }
   
-  // Try to mark by normalized link
-  if (link) {
+  // Use the existing record's GUID to mark (most reliable)
+  const actualGuid = existing.guid;
+  const stmt = db.prepare('UPDATE news SET isSent = 1 WHERE guid = ? AND isSent = 0');
+  const result = stmt.run(actualGuid);
+  
+  // Also mark any other records with same link or title (catch all duplicates)
+  if (link && link.trim()) {
     const normalizedLink = normalizeLink(link);
-    const stmt = db.prepare('UPDATE news SET isSent = 1 WHERE (LOWER(link) = ? OR link = ?) AND isSent = 0');
-    const result = stmt.run(normalizedLink, link);
-    if (result.changes > 0) return true;
+    const linkStmt = db.prepare('UPDATE news SET isSent = 1 WHERE (LOWER(link) = ? OR link = ?) AND isSent = 0');
+    linkStmt.run(normalizedLink, link);
   }
   
-  // Try to mark by normalized title
   if (title && title.length > 10) {
     const normalizedTitle = normalizeTitle(title);
-    const stmt = db.prepare('UPDATE news SET isSent = 1 WHERE LOWER(TRIM(title)) = ? AND isSent = 0');
-    const result = stmt.run(normalizedTitle);
-    if (result.changes > 0) return true;
+    const titleStmt = db.prepare('UPDATE news SET isSent = 1 WHERE LOWER(TRIM(title)) = ? AND isSent = 0');
+    titleStmt.run(normalizedTitle);
   }
   
-  return false;
+  return result.changes > 0;
 }
 
 // Check if news should be sent (exists, not sent, and can be marked as sending)
@@ -270,24 +257,27 @@ async function getLatestNewsForChat(chatId) {
     
     for (const item of itemsToSend) {
       const itemGuid = generateGuid(item);
-      
-      // Insert into database if not exists
       const itemTitle = item.title || 'No title';
       const itemLink = item.link || '';
-      const newsRecord = insertNews(itemGuid, itemTitle, itemLink, feedConfig.url);
       
-      // Skip if already sent (check by guid, title, or link)
-      if (!newsRecord || newsRecord.isSent === 1) {
-        continue;
-      }
-      
-      // Double check if already sent by title or link
+      // Check if already sent BEFORE inserting
       if (isNewsSent(itemGuid, itemTitle, itemLink)) {
         continue;
       }
       
+      // Insert into database if not exists
+      const newsRecord = insertNews(itemGuid, itemTitle, itemLink, feedConfig.url);
+      
+      // Skip if already sent
+      if (!newsRecord || newsRecord.isSent === 1) {
+        continue;
+      }
+      
+      // Use the actual GUID from database record (in case it was found by link/title)
+      const actualGuid = newsRecord.guid;
+      
       // Mark as sending BEFORE sending (atomic operation to prevent duplicates)
-      const marked = markNewsAsSent(itemGuid, itemTitle, itemLink);
+      const marked = markNewsAsSent(actualGuid, itemTitle, itemLink);
       if (!marked) {
         // Another process already marked it as sent, skip
         continue;
@@ -335,16 +325,23 @@ async function checkForNewNews() {
       const itemTitle = item.title || 'No title';
       const itemLink = item.link || '';
       
+      // Check if already sent BEFORE inserting
+      if (isNewsSent(itemGuid, itemTitle, itemLink)) {
+        continue; // Already sent, skip
+      }
+      
       // Insert into database if not exists (returns news record)
       const newsRecord = insertNews(itemGuid, itemTitle, itemLink, feedConfig.url);
       
       // Only process if news exists and hasn't been sent yet
-      // Also check by title and link to catch duplicates
       if (newsRecord && newsRecord.isSent === 0) {
-        // Double check if already sent by title or link
-        if (!isNewsSent(itemGuid, itemTitle, itemLink)) {
-          newItems.push({ item, guid: itemGuid, title: itemTitle, link: itemLink });
-        }
+        // Use the actual GUID from the database record (in case it was found by link/title)
+        newItems.push({ 
+          item, 
+          guid: newsRecord.guid, // Use actual GUID from DB
+          title: itemTitle, 
+          link: itemLink 
+        });
       }
     }
 
@@ -364,13 +361,21 @@ async function checkForNewNews() {
     let totalSent = 0;
     
     for (const { item, guid: itemGuid, title: itemTitle, link: itemLink } of newItems) {
+      // Double-check if already sent (race condition protection)
+      if (isNewsSent(itemGuid, itemTitle, itemLink)) {
+        console.log(`⏭️  Skipping "${item.title.substring(0, 50)}..." - already sent`);
+        continue;
+      }
+      
       // Mark as sending BEFORE sending (atomic operation to prevent duplicates)
       const marked = markNewsAsSent(itemGuid, itemTitle, itemLink);
       if (!marked) {
         // Another process already marked it as sent, skip
-        console.log(`⏭️  Skipping "${item.title.substring(0, 50)}..." - already being sent`);
+        console.log(`⏭️  Skipping "${item.title.substring(0, 50)}..." - already being sent by another process`);
         continue;
       }
+      
+      console.log(`📤 Preparing to send: "${item.title.substring(0, 50)}..." (GUID: ${itemGuid.substring(0, 30)}...)`);
       
       const message = formatNewsMessage(feedConfig.name, item);
       let sentCount = 0;
