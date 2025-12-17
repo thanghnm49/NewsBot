@@ -6,11 +6,13 @@ RUN apk add --no-cache git python3 make g++ sqlite-dev
 
 WORKDIR /app
 
-# Copy package files (package-lock.json must exist for npm ci)
+# Copy package files
 COPY package.json package-lock.json ./
 
-# Install dependencies
-RUN npm ci --only=production
+# Ensure package-lock.json is in sync, then use npm ci
+# This updates the lock file if needed, then installs with npm ci
+RUN npm install --package-lock-only && \
+    npm ci --only=production
 
 # Copy entrypoint script
 COPY entrypoint.sh /app/entrypoint.sh
