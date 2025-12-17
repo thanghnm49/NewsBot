@@ -4,6 +4,9 @@
 
 set -e
 
+# Ensure this script is executable
+chmod +x /app/entrypoint.sh 2>/dev/null || true
+
 GIT_REPO_URL=${GIT_REPO_URL:-https://github.com/thanghnm49/NewsBot.git}
 GIT_BRANCH=${GIT_BRANCH:-main}
 
