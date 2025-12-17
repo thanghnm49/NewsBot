@@ -14,11 +14,12 @@ COPY package.json package-lock.json ./
 RUN npm install --package-lock-only && \
     npm ci --only=production
 
-# Copy entrypoint script and ensure it's executable
-COPY --chmod=755 entrypoint.sh /app/entrypoint.sh
-
-# Copy application files
+# Copy application files first (but exclude entrypoint.sh to avoid overwriting)
 COPY . .
+
+# Copy entrypoint script last and ensure it's executable
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # Create directory for state file
 RUN mkdir -p /app && chmod 755 /app

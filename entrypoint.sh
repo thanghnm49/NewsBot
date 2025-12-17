@@ -18,6 +18,8 @@ if [ -d .git ]; then
     git fetch origin
     git reset --hard origin/$GIT_BRANCH || git reset --hard origin/main || git pull origin main || git pull origin master || true
     echo "✅ Code updated"
+    # Ensure entrypoint script is still executable after git operations
+    chmod +x /app/entrypoint.sh 2>/dev/null || true
 else
     echo "📥 Cloning repository from GitHub..."
     # If not a git repo, clone it
@@ -30,6 +32,8 @@ else
     cp -r .[^.]* /app/ 2>/dev/null || true
     cd /app
     echo "✅ Repository cloned"
+    # Ensure entrypoint script is executable after copy
+    chmod +x /app/entrypoint.sh 2>/dev/null || true
 fi
 
 # Install/update dependencies (only if package.json changed)
