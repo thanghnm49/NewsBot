@@ -1,0 +1,24 @@
+{
+  "name": "telegram-newsbot",
+  "version": "1.0.0",
+  "description": "Telegram bot that fetches and sends RSS news updates",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "rss",
+    "news"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "node-telegram-bot-api": "^0.64.0",
+    "rss-parser": "^3.13.0",
+    "dotenv": "^16.3.1"
+  }
+}
+

@@ -1,0 +1,11 @@
+[
+  {
+    "name": "BBC News",
+    "url": "https://feeds.bbci.co.uk/news/rss.xml"
+  },
+  {
+    "name": "TechCrunch",
+    "url": "https://techcrunch.com/feed/"
+  }
+]
+

@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  newsbot:
+    build: .
+    container_name: telegram-newsbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./state.json:/app/state.json
+      - ./rss-feeds.json:/app/rss-feeds.json
+    environment:
+      - NODE_ENV=production
+
