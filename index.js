@@ -17,6 +17,8 @@ const parser = new Parser();
 // Configuration
 const CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes in milliseconds
 const STATE_FILE = path.join(__dirname, 'state.json');
+const MAX_NEWS_PER_FEED = 10; // Maximum number of news items to check per feed
+const MAX_MANUAL_NEWS = 5; // Maximum number of news items to send for /news command
 
 // Load RSS feeds from config
 let rssFeeds = [];
@@ -29,7 +31,17 @@ let state = {};
 async function loadState() {
   try {
     const data = await fs.readFile(STATE_FILE, 'utf8');
-    state = JSON.parse(data);
+    const loadedState = JSON.parse(data);
+    // Migrate old state format (single GUID) to new format (array of GUIDs)
+    state = {};
+    for (const [key, value] of Object.entries(loadedState)) {
+      if (Array.isArray(value)) {
+        state[key] = value;
+      } else {
+        // Old format: single GUID string, convert to array
+        state[key] = value ? [value] : [];
+      }
+    }
   } catch (error) {
     if (error.code === 'ENOENT') {
       state = {};
@@ -95,19 +107,24 @@ async function getLatestNewsForChat(chatId) {
       continue;
     }
 
-    // Get the latest item
-    const latestItem = feed.items[0];
-    const message = formatNewsMessage(feedConfig.name, latestItem);
+    // Get multiple latest items (limit to MAX_MANUAL_NEWS)
+    const itemsToSend = feed.items.slice(0, MAX_MANUAL_NEWS);
     
-    try {
-      await bot.sendMessage(chatId, message, {
-        parse_mode: 'HTML',
-        disable_web_page_preview: false
-      });
-      newsFound++;
-    } catch (error) {
-      console.error(`Error sending news to chat ${chatId}:`, error.message);
-      throw error;
+    for (const item of itemsToSend) {
+      const message = formatNewsMessage(feedConfig.name, item);
+      
+      try {
+        await bot.sendMessage(chatId, message, {
+          parse_mode: 'HTML',
+          disable_web_page_preview: false
+        });
+        newsFound++;
+        // Small delay between messages to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 500));
+      } catch (error) {
+        console.error(`Error sending news to chat ${chatId}:`, error.message);
+        // Continue with next item instead of throwing
+      }
     }
   }
   
@@ -125,27 +142,42 @@ async function checkForNewNews() {
     }
 
     const feedKey = feedConfig.url;
-    const lastSeenGuid = state[feedKey] || null;
+    const seenGuids = state[feedKey] || [];
+    const seenGuidsSet = new Set(seenGuids);
     
-    // Get the latest item
-    const latestItem = feed.items[0];
-    const currentGuid = latestItem.guid || latestItem.link || latestItem.title;
-
-    // Check if this is a new item
-    if (currentGuid !== lastSeenGuid) {
-      console.log(`New news found in ${feedConfig.name}: ${latestItem.title}`);
-      
-      // Check if there are any subscribers
-      if (chatIds.size === 0) {
-        console.log(`⚠️  No subscribers found. Users need to send /start to receive news updates.`);
-        // Still update state so we don't send duplicate messages later
-        state[feedKey] = currentGuid;
-        await saveState();
-        continue;
+    // Get items to check (limit to MAX_NEWS_PER_FEED)
+    const itemsToCheck = feed.items.slice(0, MAX_NEWS_PER_FEED);
+    const newItems = [];
+    
+    // Find all new items
+    for (const item of itemsToCheck) {
+      const itemGuid = item.guid || item.link || item.title;
+      if (!seenGuidsSet.has(itemGuid)) {
+        newItems.push(item);
+        seenGuidsSet.add(itemGuid);
       }
-      
-      // Send to all subscribed chats
-      const message = formatNewsMessage(feedConfig.name, latestItem);
+    }
+
+    if (newItems.length === 0) {
+      continue; // No new items
+    }
+
+    console.log(`Found ${newItems.length} new news item(s) in ${feedConfig.name}`);
+    
+    // Check if there are any subscribers
+    if (chatIds.size === 0) {
+      console.log(`⚠️  No subscribers found. Users need to send /start to receive news updates.`);
+      // Still update state so we don't send duplicate messages later
+      state[feedKey] = Array.from(seenGuidsSet);
+      await saveState();
+      continue;
+    }
+    
+    // Send all new items to all subscribed chats
+    let totalSent = 0;
+    
+    for (const item of newItems) {
+      const message = formatNewsMessage(feedConfig.name, item);
       let sentCount = 0;
       
       for (const chatId of chatIds) {
@@ -155,7 +187,8 @@ async function checkForNewNews() {
             disable_web_page_preview: false
           });
           sentCount++;
-          console.log(`✅ Message sent to chat ${chatId}`);
+          // Small delay between messages to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 300));
         } catch (error) {
           console.error(`❌ Error sending message to chat ${chatId}:`, error.message);
           // Remove invalid chat IDs
@@ -165,13 +198,18 @@ async function checkForNewNews() {
           }
         }
       }
-
-      console.log(`📤 Sent news to ${sentCount} subscriber(s)`);
-
-      // Update state
-      state[feedKey] = currentGuid;
-      await saveState();
+      
+      totalSent += sentCount;
+      console.log(`✅ Sent "${item.title.substring(0, 50)}..." to ${sentCount} subscriber(s)`);
     }
+
+    console.log(`📤 Sent ${newItems.length} news item(s) to ${totalSent / newItems.length} subscriber(s) from ${feedConfig.name}`);
+
+    // Update state with all seen GUIDs (keep only recent ones to avoid state file growing too large)
+    const allSeenGuids = Array.from(seenGuidsSet);
+    // Keep only the most recent MAX_NEWS_PER_FEED * 2 GUIDs to prevent state file from growing too large
+    state[feedKey] = allSeenGuids.slice(0, MAX_NEWS_PER_FEED * 2);
+    await saveState();
   }
 }
 
@@ -279,7 +317,7 @@ bot.onText(/\/news/, async (msg) => {
     if (newsCount === 0) {
       await bot.sendMessage(chatId, '📭 No news feeds available or all feeds are empty.');
     } else {
-      await bot.sendMessage(chatId, `✅ Sent ${newsCount} latest news item(s) from all feeds.`);
+      await bot.sendMessage(chatId, `✅ Sent ${newsCount} latest news item(s) from all feeds (up to ${MAX_MANUAL_NEWS} per feed).`);
     }
   } catch (error) {
     console.error('Error during manual news check:', error);

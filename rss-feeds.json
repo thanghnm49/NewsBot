@@ -1,11 +1,11 @@
 [
   {
-    "name": "BBC News",
-    "url": "https://feeds.bbci.co.uk/news/rss.xml"
+    "name": "vnexprees",
+    "url": "https://vnexpress.net/rss/tin-moi-nhat.rss"
   },
   {
-    "name": "TechCrunch",
-    "url": "https://techcrunch.com/feed/"
+    "name": "tuoitre",
+    "url": "https://tuoitre.vn/rss/tin-moi-nhat.rss"
   }
 ]
 
