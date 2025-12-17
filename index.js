@@ -85,6 +85,35 @@ async function fetchRSSFeed(feedConfig) {
   }
 }
 
+// Get latest news and send to specific chat (for manual requests)
+async function getLatestNewsForChat(chatId) {
+  let newsFound = 0;
+  
+  for (const feedConfig of rssFeeds) {
+    const feed = await fetchRSSFeed(feedConfig);
+    if (!feed || !feed.items || feed.items.length === 0) {
+      continue;
+    }
+
+    // Get the latest item
+    const latestItem = feed.items[0];
+    const message = formatNewsMessage(feedConfig.name, latestItem);
+    
+    try {
+      await bot.sendMessage(chatId, message, {
+        parse_mode: 'HTML',
+        disable_web_page_preview: false
+      });
+      newsFound++;
+    } catch (error) {
+      console.error(`Error sending news to chat ${chatId}:`, error.message);
+      throw error;
+    }
+  }
+  
+  return newsFound;
+}
+
 // Check for new news items
 async function checkForNewNews() {
   console.log(`[${new Date().toISOString()}] Checking for new news...`);
@@ -106,8 +135,18 @@ async function checkForNewNews() {
     if (currentGuid !== lastSeenGuid) {
       console.log(`New news found in ${feedConfig.name}: ${latestItem.title}`);
       
+      // Check if there are any subscribers
+      if (chatIds.size === 0) {
+        console.log(`⚠️  No subscribers found. Users need to send /start to receive news updates.`);
+        // Still update state so we don't send duplicate messages later
+        state[feedKey] = currentGuid;
+        await saveState();
+        continue;
+      }
+      
       // Send to all subscribed chats
       const message = formatNewsMessage(feedConfig.name, latestItem);
+      let sentCount = 0;
       
       for (const chatId of chatIds) {
         try {
@@ -115,14 +154,19 @@ async function checkForNewNews() {
             parse_mode: 'HTML',
             disable_web_page_preview: false
           });
+          sentCount++;
+          console.log(`✅ Message sent to chat ${chatId}`);
         } catch (error) {
-          console.error(`Error sending message to chat ${chatId}:`, error.message);
+          console.error(`❌ Error sending message to chat ${chatId}:`, error.message);
           // Remove invalid chat IDs
           if (error.response?.statusCode === 403 || error.response?.statusCode === 400) {
             chatIds.delete(chatId);
+            console.log(`Removed invalid chat ID: ${chatId}`);
           }
         }
       }
+
+      console.log(`📤 Sent news to ${sentCount} subscriber(s)`);
 
       // Update state
       state[feedKey] = currentGuid;
@@ -168,15 +212,24 @@ function escapeHtml(text) {
 // Telegram bot commands
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
+  const wasSubscribed = chatIds.has(chatId);
   chatIds.add(chatId);
+  console.log(`✅ User ${chatId} subscribed. Total subscribers: ${chatIds.size}`);
+  
+  const message = wasSubscribed 
+    ? '✅ You are already subscribed!\n\n'
+    : '✅ You are now subscribed to news updates!\n\n';
+  
   await bot.sendMessage(chatId, 
     '👋 Welcome to NewsBot!\n\n' +
+    message +
     'I will automatically send you the latest news from configured RSS feeds every 5 minutes.\n\n' +
     'Commands:\n' +
     '/start - Start receiving news updates\n' +
     '/stop - Stop receiving news updates\n' +
     '/status - Check bot status\n' +
-    '/feeds - List configured RSS feeds'
+    '/feeds - List configured RSS feeds\n' +
+    '/news - Manually check for latest news'
   );
 });
 
@@ -215,6 +268,25 @@ bot.onText(/\/feeds/, async (msg) => {
   await bot.sendMessage(chatId, message);
 });
 
+bot.onText(/\/news/, async (msg) => {
+  const chatId = msg.chat.id;
+  console.log(`User ${chatId} requested manual news check`);
+  
+  await bot.sendMessage(chatId, '🔍 Fetching latest news from all feeds...');
+  
+  try {
+    const newsCount = await getLatestNewsForChat(chatId);
+    if (newsCount === 0) {
+      await bot.sendMessage(chatId, '📭 No news feeds available or all feeds are empty.');
+    } else {
+      await bot.sendMessage(chatId, `✅ Sent ${newsCount} latest news item(s) from all feeds.`);
+    }
+  } catch (error) {
+    console.error('Error during manual news check:', error);
+    await bot.sendMessage(chatId, '❌ Error occurred while fetching news. Please try again later.');
+  }
+});
+
 // Handle errors
 bot.on('polling_error', (error) => {
   console.error('Polling error:', error);
@@ -235,6 +307,10 @@ async function start() {
   
   console.log(`NewsBot is running! Checking for news every ${CHECK_INTERVAL / 1000 / 60} minutes.`);
   console.log(`Monitoring ${rssFeeds.length} RSS feed(s).`);
+  console.log(`Current subscribers: ${chatIds.size}`);
+  if (chatIds.size === 0) {
+    console.log(`⚠️  No subscribers yet. Users need to send /start to the bot to receive news updates.`);
+  }
 }
 
 // Start the bot
