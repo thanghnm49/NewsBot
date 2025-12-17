@@ -260,26 +260,33 @@ async function getLatestNewsForChat(chatId) {
       const itemTitle = item.title || 'No title';
       const itemLink = item.link || '';
       
-      // Check if already sent BEFORE inserting
-      if (isNewsSent(itemGuid, itemTitle, itemLink)) {
-        continue;
-      }
-      
       // Insert into database if not exists
       const newsRecord = insertNews(itemGuid, itemTitle, itemLink, feedConfig.url);
       
-      // Skip if already sent
-      if (!newsRecord || newsRecord.isSent === 1) {
+      if (!newsRecord) {
         continue;
       }
       
-      // Use the actual GUID from database record (in case it was found by link/title)
-      const actualGuid = newsRecord.guid;
+      // Check the actual database record's isSent status
+      const checkStmt = db.prepare('SELECT isSent FROM news WHERE id = ?');
+      const currentStatus = checkStmt.get(newsRecord.id);
       
-      // Mark as sending BEFORE sending (atomic operation to prevent duplicates)
-      const marked = markNewsAsSent(actualGuid, itemTitle, itemLink);
+      if (!currentStatus || currentStatus.isSent === 1) {
+        continue; // Already sent
+      }
+      
+      // Double-check by guid, title, link
+      if (isNewsSent(newsRecord.guid, itemTitle, itemLink)) {
+        continue;
+      }
+      
+      // Mark as sending BEFORE sending using DB ID (most reliable)
+      const stmt = db.prepare('UPDATE news SET isSent = 1 WHERE id = ? AND isSent = 0');
+      const result = stmt.run(newsRecord.id);
+      const marked = result.changes > 0;
+      
       if (!marked) {
-        // Another process already marked it as sent, skip
+        // Already marked as sent, skip
         continue;
       }
       
@@ -325,24 +332,38 @@ async function checkForNewNews() {
       const itemTitle = item.title || 'No title';
       const itemLink = item.link || '';
       
-      // Check if already sent BEFORE inserting
-      if (isNewsSent(itemGuid, itemTitle, itemLink)) {
-        continue; // Already sent, skip
-      }
-      
       // Insert into database if not exists (returns news record)
       const newsRecord = insertNews(itemGuid, itemTitle, itemLink, feedConfig.url);
       
-      // Only process if news exists and hasn't been sent yet
-      if (newsRecord && newsRecord.isSent === 0) {
-        // Use the actual GUID from the database record (in case it was found by link/title)
-        newItems.push({ 
-          item, 
-          guid: newsRecord.guid, // Use actual GUID from DB
-          title: itemTitle, 
-          link: itemLink 
-        });
+      if (!newsRecord) {
+        console.log(`⚠️  Failed to get news record for: ${itemTitle.substring(0, 50)}...`);
+        continue;
       }
+      
+      // Check the actual database record's isSent status
+      // Refresh from database to get latest status (important for race conditions)
+      const checkStmt = db.prepare('SELECT isSent FROM news WHERE id = ?');
+      const currentStatus = checkStmt.get(newsRecord.id);
+      
+      if (!currentStatus || currentStatus.isSent === 1) {
+        // Already sent, skip
+        continue;
+      }
+      
+      // Double-check by guid, title, and link to catch any duplicates
+      if (isNewsSent(newsRecord.guid, itemTitle, itemLink)) {
+        console.log(`⏭️  Duplicate detected and already sent: ${itemTitle.substring(0, 50)}...`);
+        continue;
+      }
+      
+      // Use the actual GUID from the database record (in case it was found by link/title)
+      newItems.push({ 
+        item, 
+        guid: newsRecord.guid, // Use actual GUID from DB
+        title: itemTitle, 
+        link: itemLink,
+        dbId: newsRecord.id // Store DB ID for reliable marking
+      });
     }
 
     if (newItems.length === 0) {
@@ -360,22 +381,44 @@ async function checkForNewNews() {
     // Send all new items to all subscribed chats
     let totalSent = 0;
     
-    for (const { item, guid: itemGuid, title: itemTitle, link: itemLink } of newItems) {
-      // Double-check if already sent (race condition protection)
+    for (const { item, guid: itemGuid, title: itemTitle, link: itemLink, dbId } of newItems) {
+      // Double-check if already sent using database ID (most reliable)
+      if (dbId) {
+        const checkStmt = db.prepare('SELECT isSent FROM news WHERE id = ?');
+        const currentStatus = checkStmt.get(dbId);
+        if (currentStatus && currentStatus.isSent === 1) {
+          console.log(`⏭️  Skipping "${item.title.substring(0, 50)}..." - already sent (checked by DB ID)`);
+          continue;
+        }
+      }
+      
+      // Also check by guid, title, link
       if (isNewsSent(itemGuid, itemTitle, itemLink)) {
-        console.log(`⏭️  Skipping "${item.title.substring(0, 50)}..." - already sent`);
+        console.log(`⏭️  Skipping "${item.title.substring(0, 50)}..." - already sent (checked by guid/title/link)`);
         continue;
       }
       
       // Mark as sending BEFORE sending (atomic operation to prevent duplicates)
-      const marked = markNewsAsSent(itemGuid, itemTitle, itemLink);
+      // Use DB ID if available for most reliable marking
+      let marked = false;
+      if (dbId) {
+        const stmt = db.prepare('UPDATE news SET isSent = 1 WHERE id = ? AND isSent = 0');
+        const result = stmt.run(dbId);
+        marked = result.changes > 0;
+      }
+      
+      // Fallback to guid/title/link marking
+      if (!marked) {
+        marked = markNewsAsSent(itemGuid, itemTitle, itemLink);
+      }
+      
       if (!marked) {
         // Another process already marked it as sent, skip
         console.log(`⏭️  Skipping "${item.title.substring(0, 50)}..." - already being sent by another process`);
         continue;
       }
       
-      console.log(`📤 Preparing to send: "${item.title.substring(0, 50)}..." (GUID: ${itemGuid.substring(0, 30)}...)`);
+      console.log(`📤 Preparing to send: "${item.title.substring(0, 50)}..." (GUID: ${itemGuid.substring(0, 30)}..., DB ID: ${dbId})`);
       
       const message = formatNewsMessage(feedConfig.name, item);
       let sentCount = 0;
