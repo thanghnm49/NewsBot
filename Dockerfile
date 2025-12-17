@@ -2,8 +2,8 @@ FROM node:18-alpine
 
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
+# Copy package files (package-lock.json must exist for npm ci)
+COPY package.json package-lock.json ./
 
 # Install dependencies
 RUN npm ci --only=production
