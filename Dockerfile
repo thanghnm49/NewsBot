@@ -14,9 +14,10 @@ COPY package.json package-lock.json ./
 RUN npm install --package-lock-only && \
     npm ci --only=production
 
-# Copy entrypoint script
+# Copy entrypoint script and ensure it's executable
 COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh && \
+    ls -la /app/entrypoint.sh
 
 # Copy application files
 COPY . .
