@@ -8,8 +8,9 @@ services:
     env_file:
       - .env
     volumes:
-      - ./state.json:/app/state.json
       - ./rss-feeds.json:/app/rss-feeds.json
+      - ./index.js:/app/index.js
+      - ./package.json:/app/package.json
     environment:
       - NODE_ENV=production
 

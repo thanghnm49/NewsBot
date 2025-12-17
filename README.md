@@ -172,12 +172,46 @@ NewsBot/
 - If you want to reset, delete `state.json` and restart the bot
 - Make sure the file has write permissions
 
-## Updating RSS Feeds
+## Updating the Bot
+
+### After Code Changes (Git Pull)
+
+If you've updated the code and pulled from GitHub:
+
+**Quick restart (for code changes):**
+```bash
+chmod +x restart.sh
+./restart.sh
+```
+
+Or manually:
+```bash
+git pull
+docker-compose restart
+docker-compose logs -f
+```
+
+**Full rebuild (if dependencies changed):**
+```bash
+chmod +x rebuild.sh
+./rebuild.sh
+```
+
+Or manually:
+```bash
+git pull
+docker-compose up -d --build
+docker-compose logs -f
+```
+
+### Updating RSS Feeds
 
 Edit `rss-feeds.json` and restart the bot:
 ```bash
 docker-compose restart
 ```
+
+Note: Code files (`index.js`, `package.json`) are mounted as volumes, so code changes take effect after restart. For dependency changes, rebuild is required.
 
 ## License
 
