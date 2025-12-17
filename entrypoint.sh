@@ -29,10 +29,17 @@ else
     echo "✅ Repository cloned"
 fi
 
-# Install/update dependencies
+# Install/update dependencies (only if package.json changed)
+# Note: better-sqlite3 should already be built in Docker image
 if [ -f package.json ]; then
-    echo "📦 Installing dependencies..."
-    npm install --only=production
+    echo "📦 Checking dependencies..."
+    # Only install if node_modules doesn't exist or package.json is newer
+    if [ ! -d "node_modules" ] || [ "package.json" -nt "node_modules" ]; then
+        echo "📦 Installing/updating dependencies..."
+        npm install --only=production
+    else
+        echo "✅ Dependencies already installed"
+    fi
 fi
 
 # Start the bot

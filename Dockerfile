@@ -1,7 +1,8 @@
 FROM node:18-alpine
 
 # Install git and build tools for better-sqlite3
-RUN apk add --no-cache git python3 make g++
+# sqlite-dev is needed for better-sqlite3 native bindings
+RUN apk add --no-cache git python3 make g++ sqlite-dev
 
 WORKDIR /app
 
