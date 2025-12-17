@@ -42,29 +42,81 @@ function ensureDatabaseDirectory() {
 
 // Initialize database
 function initDatabase() {
-  // Create news table if it doesn't exist
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS news (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      guid TEXT NOT NULL UNIQUE,
-      title TEXT NOT NULL,
-      link TEXT,
-      feedUrl TEXT NOT NULL,
-      isSent INTEGER DEFAULT 0,
-      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-  
-  // Create indexes
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_guid ON news(guid);
-    CREATE INDEX IF NOT EXISTS idx_link ON news(link);
-    CREATE INDEX IF NOT EXISTS idx_title ON news(title);
-    CREATE INDEX IF NOT EXISTS idx_feedUrl ON news(feedUrl);
-    CREATE INDEX IF NOT EXISTS idx_isSent ON news(isSent)
-  `);
-  
-  console.log('Database initialized');
+  try {
+    // Check if table exists
+    const tableCheck = db.prepare(`
+      SELECT name FROM sqlite_master 
+      WHERE type='table' AND name='news'
+    `).get();
+    
+    if (!tableCheck) {
+      console.log('Creating news table...');
+      // Create news table
+      db.exec(`
+        CREATE TABLE news (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          guid TEXT NOT NULL UNIQUE,
+          title TEXT NOT NULL,
+          link TEXT,
+          feedUrl TEXT NOT NULL,
+          isSent INTEGER DEFAULT 0,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      console.log('News table created');
+    } else {
+      console.log('News table already exists');
+    }
+    
+    // Create indexes (these will be created if they don't exist)
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_guid ON news(guid);
+      CREATE INDEX IF NOT EXISTS idx_link ON news(link);
+      CREATE INDEX IF NOT EXISTS idx_title ON news(title);
+      CREATE INDEX IF NOT EXISTS idx_feedUrl ON news(feedUrl);
+      CREATE INDEX IF NOT EXISTS idx_isSent ON news(isSent)
+    `);
+    
+    // Verify table structure
+    const tableInfo = db.prepare('PRAGMA table_info(news)').all();
+    const columnNames = tableInfo.map(col => col.name);
+    console.log('Table columns:', columnNames.join(', '));
+    
+    // Check if all required columns exist
+    const requiredColumns = ['id', 'guid', 'title', 'link', 'feedUrl', 'isSent', 'createdAt'];
+    const missingColumns = requiredColumns.filter(col => !columnNames.includes(col));
+    
+    if (missingColumns.length > 0) {
+      console.warn(`Missing columns: ${missingColumns.join(', ')}. Recreating table...`);
+      // Drop and recreate table
+      db.exec('DROP TABLE IF EXISTS news');
+      db.exec(`
+        CREATE TABLE news (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          guid TEXT NOT NULL UNIQUE,
+          title TEXT NOT NULL,
+          link TEXT,
+          feedUrl TEXT NOT NULL,
+          isSent INTEGER DEFAULT 0,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      // Recreate indexes
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_guid ON news(guid);
+        CREATE INDEX IF NOT EXISTS idx_link ON news(link);
+        CREATE INDEX IF NOT EXISTS idx_title ON news(title);
+        CREATE INDEX IF NOT EXISTS idx_feedUrl ON news(feedUrl);
+        CREATE INDEX IF NOT EXISTS idx_isSent ON news(isSent)
+      `);
+      console.log('Table recreated with correct schema');
+    }
+    
+    console.log('Database initialized successfully');
+  } catch (error) {
+    console.error('Error initializing database:', error);
+    throw error;
+  }
 }
 
 // Initialize SQLite database with error handling
@@ -155,23 +207,49 @@ function findExistingNews(guid, title, link) {
   
   // Check by normalized link
   if (link && link.trim()) {
-    const normalizedLink = normalizeLink(link);
-    const stmt = db.prepare('SELECT * FROM news WHERE (LOWER(link) = ? OR link = ?) AND link IS NOT NULL AND link != ""');
-    const result = stmt.get(normalizedLink, link);
-    if (result) {
-      console.log(`Found duplicate by link: ${link.substring(0, 50)}... (existing GUID: ${result.guid})`);
-      return result;
+    try {
+      const normalizedLink = normalizeLink(link);
+      // Use simpler query that works with SQLite
+      const stmt = db.prepare('SELECT * FROM news WHERE link = ? OR link = ? COLLATE NOCASE');
+      const result = stmt.get(normalizedLink, link);
+      if (result) {
+        console.log(`Found duplicate by link: ${link.substring(0, 50)}... (existing GUID: ${result.guid})`);
+        return result;
+      }
+    } catch (error) {
+      console.error('Error checking by link:', error);
+      // Fallback to simple link check
+      try {
+        const stmt = db.prepare('SELECT * FROM news WHERE link = ?');
+        const result = stmt.get(link);
+        if (result) return result;
+      } catch (e) {
+        console.error('Error in fallback link check:', e);
+      }
     }
   }
   
   // Check by normalized title (only if title is meaningful)
   if (title && title.length > 10) {
-    const normalizedTitle = normalizeTitle(title);
-    const stmt = db.prepare('SELECT * FROM news WHERE LOWER(TRIM(title)) = ? AND title IS NOT NULL');
-    const result = stmt.get(normalizedTitle);
-    if (result) {
-      console.log(`Found duplicate by title: ${title.substring(0, 50)}... (existing GUID: ${result.guid})`);
-      return result;
+    try {
+      const normalizedTitle = normalizeTitle(title);
+      // Use simpler query
+      const stmt = db.prepare('SELECT * FROM news WHERE title = ? COLLATE NOCASE');
+      const result = stmt.get(normalizedTitle);
+      if (result) {
+        console.log(`Found duplicate by title: ${title.substring(0, 50)}... (existing GUID: ${result.guid})`);
+        return result;
+      }
+    } catch (error) {
+      console.error('Error checking by title:', error);
+      // Fallback to simple title check
+      try {
+        const stmt = db.prepare('SELECT * FROM news WHERE title = ?');
+        const result = stmt.get(title);
+        if (result) return result;
+      } catch (e) {
+        console.error('Error in fallback title check:', e);
+      }
     }
   }
   
