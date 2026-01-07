@@ -158,6 +158,7 @@ try {
 // Load RSS feeds from config
 let rssFeeds = [];
 let chatIds = new Set();
+const feedSubscribers = new Map(); // feedName (lowercase) -> Set of chat IDs
 
 // Generate consistent GUID from news item (prefer link as it's most stable)
 function generateGuid(item) {
@@ -361,6 +362,66 @@ async function loadRSSFeeds() {
   }
 }
 
+// Feed helpers
+function normalizeFeedName(name) {
+  return (name || '').trim().toLowerCase();
+}
+
+function findFeedByName(name) {
+  const normalized = normalizeFeedName(name);
+  return rssFeeds.find(feed => normalizeFeedName(feed.name) === normalized);
+}
+
+function getSubscribersForFeed(feedName) {
+  const subscribers = new Set(chatIds); // Global subscribers get every feed
+  const normalized = normalizeFeedName(feedName);
+  const specificSubs = feedSubscribers.get(normalized);
+  if (specificSubs) {
+    specificSubs.forEach(id => subscribers.add(id));
+  }
+  return subscribers;
+}
+
+function removeChatFromFeedSubscriptions(chatId) {
+  for (const subscribers of feedSubscribers.values()) {
+    subscribers.delete(chatId);
+  }
+}
+
+function chatHasAnySubscription(chatId) {
+  if (chatIds.has(chatId)) {
+    return true;
+  }
+  for (const subscribers of feedSubscribers.values()) {
+    if (subscribers.has(chatId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function getFeedsForChat(chatId) {
+  if (chatIds.has(chatId)) {
+    return rssFeeds.map(feed => feed.name);
+  }
+  const feeds = new Set();
+  for (const [feedKey, subscribers] of feedSubscribers.entries()) {
+    if (subscribers.has(chatId)) {
+      const matchingFeed = rssFeeds.find(feed => normalizeFeedName(feed.name) === feedKey);
+      feeds.add(matchingFeed?.name || feedKey);
+    }
+  }
+  return Array.from(feeds);
+}
+
+function getAllSubscribers() {
+  const all = new Set(chatIds);
+  for (const subscribers of feedSubscribers.values()) {
+    subscribers.forEach(id => all.add(id));
+  }
+  return all;
+}
+
 // Fetch and parse RSS feed
 async function fetchRSSFeed(feedConfig) {
   try {
@@ -503,8 +564,9 @@ async function checkForNewNews() {
     console.log(`Found ${newItems.length} new news item(s) in ${feedConfig.name}`);
     
     // Check if there are any subscribers
-    if (chatIds.size === 0) {
-      console.log(`⚠️  No subscribers found. Users need to send /start to receive news updates.`);
+    const subscribers = getSubscribersForFeed(feedConfig.name);
+    if (subscribers.size === 0) {
+      console.log(`⚠️  No subscribers found for ${feedConfig.name}. Users need to send /start or /follow ${feedConfig.name}.`);
       continue;
     }
     
@@ -553,7 +615,7 @@ async function checkForNewNews() {
       const message = formatNewsMessage(feedConfig.name, item);
       let sentCount = 0;
       
-      for (const chatId of chatIds) {
+      for (const chatId of subscribers) {
         try {
           await bot.sendMessage(chatId, message, {
             parse_mode: 'HTML',
@@ -567,6 +629,7 @@ async function checkForNewNews() {
           // Remove invalid chat IDs
           if (error.response?.statusCode === 403 || error.response?.statusCode === 400) {
             chatIds.delete(chatId);
+            removeChatFromFeedSubscriptions(chatId);
             console.log(`Removed invalid chat ID: ${chatId}`);
           }
         }
@@ -625,9 +688,9 @@ function escapeHtml(text) {
 // Telegram bot commands
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
-  const wasSubscribed = chatIds.has(chatId);
+  const wasSubscribed = chatHasAnySubscription(chatId);
   chatIds.add(chatId);
-  console.log(`✅ User ${chatId} subscribed. Total subscribers: ${chatIds.size}`);
+  console.log(`✅ User ${chatId} subscribed. Total subscribers: ${getAllSubscribers().size}`);
   
   const message = wasSubscribed 
     ? '✅ You are already subscribed!\n\n'
@@ -642,6 +705,7 @@ bot.onText(/\/start/, async (msg) => {
     '/stop - Stop receiving news updates\n' +
     '/status - Check bot status\n' +
     '/feeds - List configured RSS feeds\n' +
+    '/follow <feed_name> - Follow updates from a specific feed\n' +
     '/news - Manually check for latest news'
   );
 });
@@ -649,20 +713,27 @@ bot.onText(/\/start/, async (msg) => {
 bot.onText(/\/stop/, async (msg) => {
   const chatId = msg.chat.id;
   chatIds.delete(chatId);
+  removeChatFromFeedSubscriptions(chatId);
   await bot.sendMessage(chatId, 'You have been unsubscribed from news updates.');
 });
 
 bot.onText(/\/status/, async (msg) => {
   const chatId = msg.chat.id;
-  const isSubscribed = chatIds.has(chatId);
+  const isSubscribed = chatHasAnySubscription(chatId);
   const status = isSubscribed ? '✅ Subscribed' : '❌ Not subscribed';
   const feedCount = rssFeeds.length;
+  const followedFeeds = getFeedsForChat(chatId);
+  const subscriberCount = getAllSubscribers().size;
+  const followingLine = chatIds.has(chatId) 
+    ? 'All feeds' 
+    : (followedFeeds.length ? followedFeeds.join(', ') : 'None');
   
   await bot.sendMessage(chatId, 
     `Bot Status:\n\n` +
     `Subscription: ${status}\n` +
     `RSS Feeds: ${feedCount}\n` +
-    `Total Subscribers: ${chatIds.size}`
+    `Total Subscribers: ${subscriberCount}\n` +
+    `Following: ${followingLine}`
   );
 });
 
@@ -679,6 +750,31 @@ bot.onText(/\/feeds/, async (msg) => {
   });
   
   await bot.sendMessage(chatId, message);
+});
+
+bot.onText(/\/follow(?:\s+(.+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const feedName = match && match[1] ? match[1].trim() : '';
+  
+  if (!feedName) {
+    await bot.sendMessage(chatId, 'Please provide a feed name. Example: /follow vnexpress');
+    return;
+  }
+  
+  const feed = findFeedByName(feedName);
+  if (!feed) {
+    const available = rssFeeds.map(feed => feed.name).join(', ');
+    await bot.sendMessage(chatId, `Feed "${feedName}" was not found. Available feeds: ${available}`);
+    return;
+  }
+  
+  const normalized = normalizeFeedName(feed.name);
+  if (!feedSubscribers.has(normalized)) {
+    feedSubscribers.set(normalized, new Set());
+  }
+  feedSubscribers.get(normalized).add(chatId);
+  
+  await bot.sendMessage(chatId, `✅ You will now receive updates from "${feed.name}".`);
 });
 
 bot.onText(/\/news/, async (msg) => {
@@ -722,8 +818,8 @@ async function start() {
   
   console.log(`NewsBot is running! Checking for news every ${CHECK_INTERVAL / 1000 / 60} minutes.`);
   console.log(`Monitoring ${rssFeeds.length} RSS feed(s).`);
-  console.log(`Current subscribers: ${chatIds.size}`);
-  if (chatIds.size === 0) {
+  console.log(`Current subscribers: ${getAllSubscribers().size}`);
+  if (getAllSubscribers().size === 0) {
     console.log(`⚠️  No subscribers yet. Users need to send /start to the bot to receive news updates.`);
   }
 }

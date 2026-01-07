@@ -118,6 +118,7 @@ docker-compose logs -f
 - `/start` - Start receiving news updates
 - `/stop` - Stop receiving news updates
 - `/status` - Check bot status and subscription
+- `/follow <feed_name>` - Receive updates from a specific feed listed in `rss-feeds.json`
 - `/feeds` - List all configured RSS feeds
 
 ## How It Works
