@@ -54,7 +54,36 @@ TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
     "url": "https://techcrunch.com/feed/"
   }
 ]
+
 ```
+
+### Reddit OAuth (optional)
+
+1. Create a Reddit app (type: script) at https://www.reddit.com/prefs/apps
+2. Add these variables to your `.env`:
+```
+REDDIT_CLIENT_ID=your_client_id
+REDDIT_CLIENT_SECRET=your_client_secret
+REDDIT_REDIRECT_URI=http://localhost:8080
+REDDIT_USER_AGENT=NewsBot/1.0 by <your-reddit-username>
+```
+3. Add Reddit feeds to `rss-feeds.json`:
+```json
+[
+  {
+    "name": "Reddit Home",
+    "type": "reddit",
+    "source": "home",
+    "sort": "best"
+  },
+  {
+    "name": "Reddit Saved",
+    "type": "reddit",
+    "source": "saved"
+  }
+]
+```
+4. In Telegram, run `/reddit_setup` and follow the link, then send `/reddit_code <code>`
 
 ## Local Development
 
@@ -119,14 +148,19 @@ docker-compose logs -f
 - `/stop` - Stop receiving news updates
 - `/status` - Check bot status and subscription
 - `/follow <feed_name>` - Receive updates from a specific feed listed in `rss-feeds.json`
-- `/feeds` - List all configured RSS feeds
+- `/feeds` - List all configured feeds
+- `/news` - Manually check for latest news
+- `/reddit_setup` - Start Reddit OAuth setup
+- `/reddit_code <code>` - Finish Reddit OAuth setup
+- `/reddit_status` - Check Reddit connection
+- `/reddit_logout` - Disconnect Reddit
 
 ## How It Works
 
-1. The bot checks all configured RSS feeds every 5 minutes
+1. The bot checks all configured feeds (RSS or Reddit) every 5 minutes
 2. It compares the latest item GUID/link with the previously seen one
 3. If a new item is found, it sends a formatted message to all subscribed users
-4. The state is saved to `state.json` to track the last seen news
+4. The state is saved in the SQLite database to track the last seen news
 
 ## File Structure
 

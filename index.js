@@ -3,6 +3,7 @@ const Parser = require('rss-parser');
 const fs = require('fs').promises;
 const path = require('path');
 const Database = require('better-sqlite3');
+const crypto = require('crypto');
 require('dotenv').config();
 
 // Initialize Telegram Bot
@@ -21,6 +22,17 @@ const CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes in milliseconds
 const DB_FILE = path.join(__dirname, 'data', 'newsbot.db');
 const MAX_NEWS_PER_FEED = 10; // Maximum number of news items to check per feed
 const MAX_MANUAL_NEWS = 5; // Maximum number of news items to send for /news command
+
+// Reddit OAuth configuration
+const REDDIT_CLIENT_ID = process.env.REDDIT_CLIENT_ID;
+const REDDIT_CLIENT_SECRET = process.env.REDDIT_CLIENT_SECRET;
+const REDDIT_REDIRECT_URI = process.env.REDDIT_REDIRECT_URI;
+const REDDIT_USER_AGENT = process.env.REDDIT_USER_AGENT || 'NewsBot/1.0';
+const REDDIT_SCOPES = ['read', 'history', 'identity'];
+const REDDIT_AUTH_BASE = 'https://www.reddit.com/api/v1/authorize';
+const REDDIT_TOKEN_URL = 'https://www.reddit.com/api/v1/access_token';
+const REDDIT_API_BASE = 'https://oauth.reddit.com';
+const redditStates = new Map(); // chatId -> state
 
 // Ensure database directory exists and is writable (synchronous)
 function ensureDatabaseDirectory() {
@@ -75,6 +87,14 @@ function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_title ON news(title);
       CREATE INDEX IF NOT EXISTS idx_feedUrl ON news(feedUrl);
       CREATE INDEX IF NOT EXISTS idx_isSent ON news(isSent)
+    `);
+
+    // Settings table for tokens and configuration
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )
     `);
     
     // Verify table structure
@@ -153,6 +173,27 @@ try {
     console.error('Please check directory permissions and ensure /app is writable');
     process.exit(1);
   }
+}
+
+// Settings helpers (stored in SQLite)
+function getSetting(key) {
+  const stmt = db.prepare('SELECT value FROM settings WHERE key = ?');
+  const result = stmt.get(key);
+  return result ? result.value : null;
+}
+
+function setSetting(key, value) {
+  const stmt = db.prepare(`
+    INSERT INTO settings (key, value)
+    VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `);
+  stmt.run(key, value);
+}
+
+function deleteSetting(key) {
+  const stmt = db.prepare('DELETE FROM settings WHERE key = ?');
+  stmt.run(key);
 }
 
 // Load RSS feeds from config
@@ -342,7 +383,14 @@ async function loadRSSFeeds() {
   try {
     const data = await fs.readFile('rss-feeds.json', 'utf8');
     rssFeeds = JSON.parse(data);
-    console.log(`Loaded ${rssFeeds.length} RSS feeds`);
+    if (!Array.isArray(rssFeeds)) {
+      throw new Error('rss-feeds.json must contain an array');
+    }
+    console.log(`Loaded ${rssFeeds.length} feeds`);
+    const redditFeeds = rssFeeds.filter(isRedditFeed);
+    if (redditFeeds.length > 0 && !hasRedditConfig()) {
+      console.warn('Reddit feeds found but REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET/REDDIT_REDIRECT_URI not configured.');
+    }
   } catch (error) {
     console.error('Error loading RSS feeds:', error);
     console.log('Creating default rss-feeds.json file...');
@@ -422,14 +470,207 @@ function getAllSubscribers() {
   return all;
 }
 
-// Fetch and parse RSS feed
-async function fetchRSSFeed(feedConfig) {
+function isRedditFeed(feedConfig) {
+  return (feedConfig?.type || '').toLowerCase() === 'reddit';
+}
+
+function hasRedditConfig() {
+  return Boolean(REDDIT_CLIENT_ID && REDDIT_CLIENT_SECRET && REDDIT_REDIRECT_URI);
+}
+
+function buildRedditAuthUrl(chatId) {
+  const state = crypto.randomBytes(16).toString('hex');
+  redditStates.set(chatId, state);
+  const params = new URLSearchParams({
+    client_id: REDDIT_CLIENT_ID,
+    response_type: 'code',
+    state,
+    redirect_uri: REDDIT_REDIRECT_URI,
+    duration: 'permanent',
+    scope: REDDIT_SCOPES.join(' ')
+  });
+  return `${REDDIT_AUTH_BASE}?${params.toString()}`;
+}
+
+async function exchangeRedditCodeForTokens(code) {
+  const auth = Buffer.from(`${REDDIT_CLIENT_ID}:${REDDIT_CLIENT_SECRET}`).toString('base64');
+  const body = new URLSearchParams({
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: REDDIT_REDIRECT_URI
+  });
+
+  const response = await fetch(REDDIT_TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': REDDIT_USER_AGENT
+    },
+    body
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Reddit token exchange failed (${response.status}): ${text}`);
+  }
+
+  return response.json();
+}
+
+async function refreshRedditAccessToken(refreshToken) {
+  const auth = Buffer.from(`${REDDIT_CLIENT_ID}:${REDDIT_CLIENT_SECRET}`).toString('base64');
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken
+  });
+
+  const response = await fetch(REDDIT_TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': REDDIT_USER_AGENT
+    },
+    body
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Reddit refresh failed (${response.status}): ${text}`);
+  }
+
+  return response.json();
+}
+
+async function getRedditAccessToken() {
+  const refreshToken = getSetting('reddit_refresh_token');
+  if (!refreshToken) {
+    return null;
+  }
+
+  const accessToken = getSetting('reddit_access_token');
+  const expiresAtRaw = getSetting('reddit_access_expires_at');
+  const expiresAt = expiresAtRaw ? Number(expiresAtRaw) : 0;
+
+  if (accessToken && expiresAt && Date.now() < expiresAt - 60 * 1000) {
+    return accessToken;
+  }
+
+  const data = await refreshRedditAccessToken(refreshToken);
+  const newAccessToken = data.access_token;
+  const newExpiresAt = Date.now() + (data.expires_in || 3600) * 1000;
+
+  setSetting('reddit_access_token', newAccessToken);
+  setSetting('reddit_access_expires_at', String(newExpiresAt));
+
+  return newAccessToken;
+}
+
+async function getRedditUsername() {
+  const cached = getSetting('reddit_username');
+  if (cached) {
+    return cached;
+  }
+
+  const token = await getRedditAccessToken();
+  if (!token) {
+    return null;
+  }
+
+  const response = await fetch(`${REDDIT_API_BASE}/api/v1/me`, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'User-Agent': REDDIT_USER_AGENT
+    }
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Reddit user lookup failed (${response.status}): ${text}`);
+  }
+
+  const data = await response.json();
+  if (data?.name) {
+    setSetting('reddit_username', data.name);
+  }
+  return data?.name || null;
+}
+
+async function fetchRedditFeedItems(feedConfig, limit) {
+  const token = await getRedditAccessToken();
+  if (!token) {
+    console.warn(`Reddit access token not configured. Skipping ${feedConfig.name}.`);
+    return [];
+  }
+
+  const source = (feedConfig.source || 'home').toLowerCase();
+  const sort = (feedConfig.sort || 'best').toLowerCase();
+  let endpoint = '';
+
+  if (source === 'home') {
+    endpoint = `/${sort}`;
+  } else if (source === 'saved') {
+    const username = await getRedditUsername();
+    if (!username) {
+      console.warn('Unable to resolve Reddit username for saved items.');
+      return [];
+    }
+    endpoint = `/user/${encodeURIComponent(username)}/saved`;
+  } else if (source === 'subreddit') {
+    if (!feedConfig.subreddit) {
+      console.warn(`Reddit feed "${feedConfig.name}" missing subreddit name.`);
+      return [];
+    }
+    endpoint = `/r/${encodeURIComponent(feedConfig.subreddit)}/${sort}`;
+  } else {
+    console.warn(`Unknown Reddit source "${feedConfig.source}" for ${feedConfig.name}.`);
+    return [];
+  }
+
+  const params = new URLSearchParams({ limit: String(limit || MAX_NEWS_PER_FEED) });
+  const response = await fetch(`${REDDIT_API_BASE}${endpoint}?${params.toString()}`, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'User-Agent': REDDIT_USER_AGENT
+    }
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    console.error(`Error fetching Reddit feed ${feedConfig.name}:`, text);
+    return [];
+  }
+
+  const data = await response.json();
+  const children = data?.data?.children || [];
+
+  return children
+    .filter(child => child?.data?.id)
+    .map(child => {
+      const post = child.data;
+      return {
+        guid: `reddit:${post.id}`,
+        title: post.title || 'No title',
+        link: `https://www.reddit.com${post.permalink}`,
+        contentSnippet: post.selftext ? post.selftext.substring(0, 200) : (post.url || ''),
+        pubDate: post.created_utc ? new Date(post.created_utc * 1000).toISOString() : ''
+      };
+    });
+}
+
+// Fetch and parse feed
+async function fetchFeedItems(feedConfig, limit) {
+  if (isRedditFeed(feedConfig)) {
+    return fetchRedditFeedItems(feedConfig, limit);
+  }
+
   try {
     const feed = await parser.parseURL(feedConfig.url);
-    return feed;
+    return feed?.items || [];
   } catch (error) {
     console.error(`Error fetching RSS feed ${feedConfig.name}:`, error.message);
-    return null;
+    return [];
   }
 }
 
@@ -438,13 +679,13 @@ async function getLatestNewsForChat(chatId) {
   let newsFound = 0;
   
   for (const feedConfig of rssFeeds) {
-    const feed = await fetchRSSFeed(feedConfig);
-    if (!feed || !feed.items || feed.items.length === 0) {
+    const items = await fetchFeedItems(feedConfig, MAX_MANUAL_NEWS);
+    if (!items || items.length === 0) {
       continue;
     }
 
     // Get multiple latest items (limit to MAX_MANUAL_NEWS)
-    const itemsToSend = feed.items.slice(0, MAX_MANUAL_NEWS);
+    const itemsToSend = items.slice(0, MAX_MANUAL_NEWS);
     
     for (const item of itemsToSend) {
       const itemGuid = generateGuid(item);
@@ -508,13 +749,13 @@ async function checkForNewNews() {
   console.log(`[${new Date().toISOString()}] Checking for new news...`);
   
   for (const feedConfig of rssFeeds) {
-    const feed = await fetchRSSFeed(feedConfig);
-    if (!feed || !feed.items || feed.items.length === 0) {
+    const items = await fetchFeedItems(feedConfig, MAX_NEWS_PER_FEED);
+    if (!items || items.length === 0) {
       continue;
     }
 
     // Get items to check (limit to MAX_NEWS_PER_FEED)
-    const itemsToCheck = feed.items.slice(0, MAX_NEWS_PER_FEED);
+    const itemsToCheck = items.slice(0, MAX_NEWS_PER_FEED);
     const newItems = [];
     
     // Find all new items that don't exist in database or haven't been sent
@@ -699,14 +940,18 @@ bot.onText(/\/start/, async (msg) => {
   await bot.sendMessage(chatId, 
     '👋 Welcome to NewsBot!\n\n' +
     message +
-    'I will automatically send you the latest news from configured RSS feeds every 5 minutes.\n\n' +
+    'I will automatically send you the latest news from configured feeds every 5 minutes.\n\n' +
     'Commands:\n' +
     '/start - Start receiving news updates\n' +
     '/stop - Stop receiving news updates\n' +
     '/status - Check bot status\n' +
-    '/feeds - List configured RSS feeds\n' +
+    '/feeds - List configured feeds\n' +
     '/follow <feed_name> - Follow updates from a specific feed\n' +
-    '/news - Manually check for latest news'
+    '/news - Manually check for latest news\n' +
+    '/reddit_setup - Start Reddit OAuth setup\n' +
+    '/reddit_code <code> - Finish Reddit OAuth setup\n' +
+    '/reddit_status - Check Reddit connection\n' +
+    '/reddit_logout - Disconnect Reddit'
   );
 });
 
@@ -731,7 +976,7 @@ bot.onText(/\/status/, async (msg) => {
   await bot.sendMessage(chatId, 
     `Bot Status:\n\n` +
     `Subscription: ${status}\n` +
-    `RSS Feeds: ${feedCount}\n` +
+    `Feeds: ${feedCount}\n` +
     `Total Subscribers: ${subscriberCount}\n` +
     `Following: ${followingLine}`
   );
@@ -740,13 +985,18 @@ bot.onText(/\/status/, async (msg) => {
 bot.onText(/\/feeds/, async (msg) => {
   const chatId = msg.chat.id;
   if (rssFeeds.length === 0) {
-    await bot.sendMessage(chatId, 'No RSS feeds configured.');
+    await bot.sendMessage(chatId, 'No feeds configured.');
     return;
   }
   
-  let message = '📡 Configured RSS Feeds:\n\n';
+  let message = 'dY"? Configured Feeds:\n\n';
   rssFeeds.forEach((feed, index) => {
-    message += `${index + 1}. ${feed.name}\n   ${feed.url}\n\n`;
+    if (isRedditFeed(feed)) {
+      const source = feed.source || 'home';
+      message += `${index + 1}. ${feed.name} (reddit)\n   source: ${source}\n\n`;
+    } else {
+      message += `${index + 1}. ${feed.name} (rss)\n   ${feed.url}\n\n`;
+    }
   });
   
   await bot.sendMessage(chatId, message);
@@ -777,6 +1027,90 @@ bot.onText(/\/follow(?:\s+(.+))?/, async (msg, match) => {
   await bot.sendMessage(chatId, `✅ You will now receive updates from "${feed.name}".`);
 });
 
+
+
+bot.onText(/\/reddit_setup/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!hasRedditConfig()) {
+    await bot.sendMessage(chatId, 'Reddit OAuth is not configured. Please set REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, and REDDIT_REDIRECT_URI.');
+    return;
+  }
+
+  const authUrl = buildRedditAuthUrl(chatId);
+  await bot.sendMessage(chatId,
+    'Open this URL to authorize NewsBot with your Reddit account:\n' +
+    `${authUrl}\n\n` +
+    'After approving, you will be redirected to your redirect URI with a code in the URL.\n' +
+    'Send the code back here using:\n' +
+    '/reddit_code <code>'
+  );
+});
+
+bot.onText(/\/reddit_code(?:\s+(.+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const code = match && match[1] ? match[1].trim() : '';
+
+  if (!code) {
+    await bot.sendMessage(chatId, 'Please provide the code from the Reddit redirect URL. Example: /reddit_code abc123');
+    return;
+  }
+
+  if (!hasRedditConfig()) {
+    await bot.sendMessage(chatId, 'Reddit OAuth is not configured. Please set REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, and REDDIT_REDIRECT_URI.');
+    return;
+  }
+
+  try {
+    const data = await exchangeRedditCodeForTokens(code);
+    if (data.refresh_token) {
+      setSetting('reddit_refresh_token', data.refresh_token);
+    }
+    if (data.access_token) {
+      setSetting('reddit_access_token', data.access_token);
+      const expiresAt = Date.now() + (data.expires_in || 3600) * 1000;
+      setSetting('reddit_access_expires_at', String(expiresAt));
+    }
+    deleteSetting('reddit_username');
+    redditStates.delete(chatId);
+
+    if (!data.refresh_token) {
+      await bot.sendMessage(chatId, 'Reddit authorized, but no refresh token was returned. If this is the first setup, make sure you approved with duration=permanent.');
+      return;
+    }
+
+    await bot.sendMessage(chatId, 'Reddit OAuth setup complete. Reddit feeds are now enabled.');
+  } catch (error) {
+    console.error('Error completing Reddit OAuth:', error);
+    await bot.sendMessage(chatId, 'Failed to complete Reddit OAuth setup. Please try again.');
+  }
+});
+
+bot.onText(/\/reddit_status/, async (msg) => {
+  const chatId = msg.chat.id;
+  const refreshToken = getSetting('reddit_refresh_token');
+  if (!refreshToken) {
+    await bot.sendMessage(chatId, 'Reddit is not connected. Use /reddit_setup to start.');
+    return;
+  }
+
+  try {
+    await getRedditAccessToken();
+    const username = await getRedditUsername();
+    await bot.sendMessage(chatId, `Reddit connected as ${username || 'unknown user'}.`);
+  } catch (error) {
+    console.error('Error checking Reddit status:', error);
+    await bot.sendMessage(chatId, 'Reddit is configured but token refresh failed. Try /reddit_setup again.');
+  }
+});
+
+bot.onText(/\/reddit_logout/, async (msg) => {
+  const chatId = msg.chat.id;
+  deleteSetting('reddit_refresh_token');
+  deleteSetting('reddit_access_token');
+  deleteSetting('reddit_access_expires_at');
+  deleteSetting('reddit_username');
+  await bot.sendMessage(chatId, 'Reddit connection removed.');
+});
 bot.onText(/\/news/, async (msg) => {
   const chatId = msg.chat.id;
   console.log(`User ${chatId} requested manual news check`);
@@ -817,7 +1151,7 @@ async function start() {
   setInterval(checkForNewNews, CHECK_INTERVAL);
   
   console.log(`NewsBot is running! Checking for news every ${CHECK_INTERVAL / 1000 / 60} minutes.`);
-  console.log(`Monitoring ${rssFeeds.length} RSS feed(s).`);
+  console.log(`Monitoring ${rssFeeds.length} feed(s).`);
   console.log(`Current subscribers: ${getAllSubscribers().size}`);
   if (getAllSubscribers().size === 0) {
     console.log(`⚠️  No subscribers yet. Users need to send /start to the bot to receive news updates.`);
